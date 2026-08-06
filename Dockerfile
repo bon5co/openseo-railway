@@ -54,7 +54,19 @@ RUN set -eu; \
     FINGERPRINT="$(env | grep -E '^(VITE_|AUTH_MODE|BYPASS_EMAIL_VERIFICATION|POSTHOG_PUBLIC_KEY|POSTHOG_HOST|TURNSTILE_SITE_KEY|POSTHOG_SOURCEMAPS)' | sort | sha256sum | cut -d' ' -f1)"; \
     test -n "$FINGERPRINT"; \
     printf '%s' "$FINGERPRINT" > dist/.openseo-build-env; \
-    echo "baked build fingerprint: $FINGERPRINT"
+    echo "baked build fingerprint: $FINGERPRINT"; \
+    cp -a /app/.wrangler /app/.wrangler-baked
+
+# The build writes `.wrangler/deploy/config.json`, which @cloudflare/vite-plugin
+# reads while `vite preview` resolves its config -- and `/app/.wrangler` is the
+# volume mount point. A Docker named volume seeds itself from the image, so this
+# is invisible locally; Railway bind-mounts an EMPTY directory over it and the
+# app dies on `ENOENT: /app/.wrangler/deploy/config.json` before it ever listens.
+# The entrypoint restores it from the copy above on every boot.
+
+# A writable scratch dir that does not depend on the runtime uid: Railway's
+# container could not create files under /tmp.
+RUN mkdir -p /run/openseo && chmod 1777 /run/openseo
 
 COPY nginx.conf.template /etc/openseo/nginx.conf.template
 COPY railway-entrypoint.sh /usr/local/bin/railway-entrypoint.sh

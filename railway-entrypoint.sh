@@ -31,18 +31,47 @@ else
 fi
 
 # --- volume ---------------------------------------------------------------
-# This image runs as root and Railway mounts volumes as uid 0, so there is no
-# ownership repair to do -- but a container that logs EACCES and keeps serving
-# looks exactly like one that persists, so prove the mount instead of assuming
-# it. /app/.wrangler is the whole database: D1 (projects, keywords, rank
-# history, the local admin account), KV and R2 all live under it.
+# The upstream image sets no USER, and Railway mounts volumes as uid 0, so
+# there is usually no ownership repair to do -- but a container that logs EACCES
+# and keeps serving looks exactly like one that persists, so prove the mount
+# instead of assuming it, and print the uid this actually runs as.
+# /app/.wrangler is the whole database: D1 (projects, keywords, rank history,
+# the local admin account), KV and R2 all live under it.
 mkdir -p "$DATA_DIR"
+log "running as $(id -u):$(id -g)"
 if : > "$DATA_DIR/.railway-write-test" 2>/dev/null; then
     rm -f "$DATA_DIR/.railway-write-test"
     log "volume $DATA_DIR owner=$(stat -c %u:%g "$DATA_DIR") writable=yes"
 else
     log "ERROR: volume $DATA_DIR is NOT writable (owner=$(stat -c %u:%g "$DATA_DIR")). Every project, keyword and rank check will be lost on the next deploy."
 fi
+
+# The volume is mounted OVER the directory the image build wrote
+# `.wrangler/deploy/config.json` into, and @cloudflare/vite-plugin reads that
+# file while `vite preview` resolves its config. Restore it every boot: it is
+# build output, not state, so it must track the image rather than the volume.
+if [ -d /app/.wrangler-baked ]; then
+    cp -a /app/.wrangler-baked/. "$DATA_DIR/" 2>/dev/null \
+        && log "restored wrangler build config into the volume" \
+        || log "WARNING: could not restore /app/.wrangler-baked into $DATA_DIR"
+fi
+
+# Somewhere to write the gate's config and password file. /tmp is not usable on
+# Railway ("cannot create /tmp/openseo.htpasswd: Permission denied" on a live
+# deploy), so probe rather than assume, and say which one won.
+RUNDIR=""
+for d in /run/openseo /tmp/openseo "$DATA_DIR/.gate"; do
+    if mkdir -p "$d" 2>/dev/null && : > "$d/.w" 2>/dev/null; then
+        rm -f "$d/.w"
+        RUNDIR="$d"
+        break
+    fi
+done
+if [ -z "$RUNDIR" ]; then
+    log "ERROR: no writable scratch directory for the gate (tried /run/openseo, /tmp/openseo, $DATA_DIR/.gate)"
+    exit 1
+fi
+log "gate scratch dir: $RUNDIR"
 
 # --- gate credentials -----------------------------------------------------
 ADMIN_USER="${OPENSEO_ADMIN_USER:-admin}"
@@ -54,7 +83,7 @@ if [ -z "${OPENSEO_ADMIN_PASSWORD:-}" ]; then
     exit 1
 fi
 
-HTPASSWD=/tmp/openseo.htpasswd
+HTPASSWD="$RUNDIR/openseo.htpasswd"
 if hash="$(openssl passwd -apr1 "$OPENSEO_ADMIN_PASSWORD" 2>/dev/null)" && [ -n "$hash" ]; then
     printf '%s:%s\n' "$ADMIN_USER" "$hash" > "$HTPASSWD"
 else
@@ -63,13 +92,20 @@ else
     printf '%s:{SHA}%s\n' "$ADMIN_USER" \
         "$(printf '%s' "$OPENSEO_ADMIN_PASSWORD" | openssl sha1 -binary | openssl base64)" > "$HTPASSWD"
 fi
-# nginx workers drop to www-data (Debian's compiled-in default) while this
-# script runs as root, so a root-only file makes every gated request 500 with
-# `open() "/tmp/openseo.htpasswd" failed (13: Permission denied)` -- and the
-# cookie path still works, which makes it look like an app bug rather than a
-# permissions one.
-chmod 400 "$HTPASSWD"
-chown www-data:www-data "$HTPASSWD" 2>/dev/null || chmod 444 "$HTPASSWD"
+# When this script runs as root, nginx's master keeps root and its workers drop
+# to the user named by the `user` directive, so the file has to be readable by
+# THAT user -- a root-only file makes every gated request 500 with
+# `open() ... failed (13: Permission denied)` while the cookie path keeps
+# working, which reads as an app fault. When it runs as anyone else there is no
+# privilege drop and the workers inherit this uid.
+if [ "$(id -u)" = "0" ] && chown www-data:www-data "$HTPASSWD" 2>/dev/null; then
+    chmod 400 "$HTPASSWD"
+    OPENSEO_NGINX_USER="user www-data;"
+else
+    chmod 400 "$HTPASSWD"
+    OPENSEO_NGINX_USER=""
+fi
+export OPENSEO_NGINX_USER OPENSEO_RUNDIR="$RUNDIR"
 
 # Browsers do not reliably attach basic-auth credentials to a WebSocket
 # handshake, and OpenSEO's in-app agent (SAM) talks over /agents/ via
@@ -109,9 +145,8 @@ done
 
 # --- gate -----------------------------------------------------------------
 export PORT="$LISTEN_PORT"
-envsubst '${PORT} ${OPENSEO_APP_PORT} ${OPENSEO_MAX_BODY_SIZE} ${OPENSEO_RATE} ${OPENSEO_RATE_BURST} ${OPENSEO_MCP_TOKEN} ${OPENSEO_GATE_COOKIE}' \
-    < /etc/openseo/nginx.conf.template > /tmp/nginx.conf
-mkdir -p /tmp/nginx
+envsubst '${PORT} ${OPENSEO_APP_PORT} ${OPENSEO_MAX_BODY_SIZE} ${OPENSEO_RATE} ${OPENSEO_RATE_BURST} ${OPENSEO_MCP_TOKEN} ${OPENSEO_GATE_COOKIE} ${OPENSEO_NGINX_USER} ${OPENSEO_RUNDIR}' \
+    < /etc/openseo/nginx.conf.template > "$RUNDIR/nginx.conf"
 log "gate listening on ${LISTEN_PORT}: UI behind ${ADMIN_USER}:<OPENSEO_ADMIN_PASSWORD>, /mcp behind bearer OPENSEO_MCP_TOKEN, /api/health open for the Railway healthcheck"
 
 # nginx becomes PID 1 below. If the app dies the container has to die with it,
@@ -122,4 +157,4 @@ log "gate listening on ${LISTEN_PORT}: UI behind ${ADMIN_USER}:<OPENSEO_ADMIN_PA
     kill 1 2>/dev/null || true
 ) &
 
-exec nginx -c /tmp/nginx.conf -g 'daemon off;'
+exec nginx -c "$RUNDIR/nginx.conf" -g 'daemon off;'

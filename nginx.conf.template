@@ -1,12 +1,15 @@
 # This config replaces Debian's, which is where the `user` directive normally
-# lives. Without it nginx falls back to its compiled-in default (`nobody`) and
-# the workers cannot read the www-data-owned password file -- every gated
-# request then 500s with "Permission denied" while the cookie path still
-# works, which reads as an app fault rather than a permissions one.
-user www-data;
+# lives. Without one nginx falls back to its compiled-in default (`nobody`) and
+# the workers cannot read the password file -- every gated request then 500s
+# with "Permission denied" while the cookie path still works, which reads as an
+# app fault rather than a permissions one. The entrypoint fills this in with
+# `user www-data;` when it runs as root and leaves it empty when it does not,
+# because a `user` directive without privileges is only a warning and the
+# workers then inherit the runtime uid, which already owns the file.
+${OPENSEO_NGINX_USER}
 worker_processes auto;
 error_log /dev/stderr warn;
-pid /tmp/nginx.pid;
+pid ${OPENSEO_RUNDIR}/nginx.pid;
 
 events {
     worker_connections 1024;
@@ -16,8 +19,8 @@ http {
     access_log off;
     server_tokens off;
     client_max_body_size ${OPENSEO_MAX_BODY_SIZE};
-    client_body_temp_path /tmp/nginx-client;
-    proxy_temp_path /tmp/nginx-proxy;
+    client_body_temp_path ${OPENSEO_RUNDIR}/client;
+    proxy_temp_path ${OPENSEO_RUNDIR}/proxy;
 
     # The map keys below are a bearer token and a 64-character cookie value,
     # both longer than the default 64-byte bucket. Without this nginx refuses
@@ -111,14 +114,14 @@ http {
         # The agent WebSocket. Buffering off so tokens stream.
         location /agents/ {
             auth_basic $openseo_realm;
-            auth_basic_user_file /tmp/openseo.htpasswd;
+            auth_basic_user_file ${OPENSEO_RUNDIR}/openseo.htpasswd;
             proxy_buffering off;
             proxy_pass http://openseo;
         }
 
         location / {
             auth_basic $openseo_realm;
-            auth_basic_user_file /tmp/openseo.htpasswd;
+            auth_basic_user_file ${OPENSEO_RUNDIR}/openseo.htpasswd;
             limit_req zone=openseo burst=${OPENSEO_RATE_BURST} nodelay;
             add_header Set-Cookie "openseo_gate=${OPENSEO_GATE_COOKIE}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000" always;
             proxy_pass http://openseo;
