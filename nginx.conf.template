@@ -1,0 +1,127 @@
+# This config replaces Debian's, which is where the `user` directive normally
+# lives. Without it nginx falls back to its compiled-in default (`nobody`) and
+# the workers cannot read the www-data-owned password file -- every gated
+# request then 500s with "Permission denied" while the cookie path still
+# works, which reads as an app fault rather than a permissions one.
+user www-data;
+worker_processes auto;
+error_log /dev/stderr warn;
+pid /tmp/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    access_log off;
+    server_tokens off;
+    client_max_body_size ${OPENSEO_MAX_BODY_SIZE};
+    client_body_temp_path /tmp/nginx-client;
+    proxy_temp_path /tmp/nginx-proxy;
+
+    # The map keys below are a bearer token and a 64-character cookie value,
+    # both longer than the default 64-byte bucket. Without this nginx refuses
+    # to start: "could not build map_hash, you should increase
+    # map_hash_bucket_size".
+    map_hash_bucket_size 256;
+    map_hash_max_size 2048;
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    # Every request arrives from Railway's edge, so $remote_addr is a
+    # 100.64.0.0/10 address that is the same for the whole internet. Railway
+    # REPLACES any inbound X-Forwarded-For, so the header is trustworthy -- but
+    # only its FIRST address is the caller: the edge appends its own hop and
+    # that hop rotates between requests, so a key built from the whole header
+    # hands every retry a fresh bucket and the limiter never fires.
+    map $http_x_forwarded_for $openseo_client {
+        ''             $remote_addr;
+        '~^([^,\s]+)'  $1;
+        default        $remote_addr;
+    }
+
+    # /mcp is machine traffic: an MCP client can send a header but cannot fill
+    # in a password prompt. Exact string match, no regex, so nothing in the
+    # token needs escaping.
+    map $http_authorization $openseo_mcp_ok {
+        "Bearer ${OPENSEO_MCP_TOKEN}" 1;
+        default                       0;
+    }
+
+    # Browsers do not reliably send basic-auth credentials on a WebSocket
+    # handshake, and SAM (the in-app agent) runs over /agents/ via WebSocket.
+    # A cookie is always sent, so one is issued after the password is accepted
+    # and is accepted in its place afterwards.
+    map $cookie_openseo_gate $openseo_cookie_ok {
+        "${OPENSEO_GATE_COOKIE}" 1;
+        default                  0;
+    }
+
+    map $openseo_cookie_ok $openseo_realm {
+        1       off;
+        default "OpenSEO";
+    }
+
+    limit_req_zone $openseo_client zone=openseo:1m rate=${OPENSEO_RATE};
+    limit_req_status 429;
+
+    proxy_http_version 1.1;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+
+    upstream openseo {
+        server 127.0.0.1:${OPENSEO_APP_PORT};
+        keepalive 32;
+    }
+
+    server {
+        listen ${PORT} default_server;
+        listen [::]:${PORT} default_server;
+
+        # Railway's healthcheck is unauthenticated and arrives with
+        # `Host: healthcheck.railway.app`, which is not in vite preview's
+        # allowedHosts and would come back as "Blocked request". An IP literal
+        # is always allowed, so the health probe is rewritten to one. The
+        # endpoint is upstream's own unauthenticated setup/status route: it
+        # reports which checks pass, never a value.
+        location = /api/health {
+            proxy_set_header Host 127.0.0.1;
+            proxy_pass http://openseo;
+        }
+
+        location /mcp {
+            limit_req zone=openseo burst=${OPENSEO_RATE_BURST} nodelay;
+            default_type application/json;
+            if ($openseo_mcp_ok = 0) {
+                return 401 '{"error":"unauthorized","message":"Send Authorization: Bearer <OPENSEO_MCP_TOKEN>. OpenSEO in local_noauth mode performs no authorization of its own on /mcp."}';
+            }
+            proxy_buffering off;
+            proxy_pass http://openseo;
+        }
+
+        # The agent WebSocket. Buffering off so tokens stream.
+        location /agents/ {
+            auth_basic $openseo_realm;
+            auth_basic_user_file /tmp/openseo.htpasswd;
+            proxy_buffering off;
+            proxy_pass http://openseo;
+        }
+
+        location / {
+            auth_basic $openseo_realm;
+            auth_basic_user_file /tmp/openseo.htpasswd;
+            limit_req zone=openseo burst=${OPENSEO_RATE_BURST} nodelay;
+            add_header Set-Cookie "openseo_gate=${OPENSEO_GATE_COOKIE}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000" always;
+            proxy_pass http://openseo;
+        }
+    }
+}
