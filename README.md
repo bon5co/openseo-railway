@@ -1,5 +1,9 @@
 # openseo-railway
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/openseo-v013-or-semrush-alternative-whos?referralCode=Z1xivh&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
+**Deploy on Railway:** [OpenSEO template](https://railway.com/deploy/openseo-v013-or-semrush-alternative-whos?referralCode=Z1xivh&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
 Wrapper image for running [OpenSEO](https://github.com/every-app/open-seo) — an open-source
 alternative to Semrush and Ahrefs — on [Railway](https://railway.com).
 
